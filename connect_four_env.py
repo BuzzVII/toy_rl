@@ -5,14 +5,14 @@
 # ]
 # ///
 
-
 from dataclasses import dataclass
 from enum import Enum
 import argparse
-import random
-from typing import Literal
-
 import logging
+import pickle
+import random
+from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -25,7 +25,7 @@ EMPTY = 0
 PLAYER_ONE = 1
 PLAYER_TWO = 2
 
-PlayerKind = Literal["human", "random"]
+PlayerKind = Literal["human", "random", "q"]
 ObservationMode = Literal["absolute", "current_player"]
 
 
@@ -256,6 +256,22 @@ class HumanPlayer:
             print(f"Illegal move. Legal columns are: {legal}")
 
 
+class QLearningPlayer:
+    """Greedy player backed by a tabular Q-table."""
+
+    def __init__(self, q_table: dict[tuple[int, ...], np.ndarray], epsilon: float = 0.0) -> None:
+        self.q_table = q_table
+        self.epsilon = epsilon
+
+    def choose_action(self, env: ConnectFourEnv) -> int:
+        return choose_epsilon_greedy_action(
+            q_table=self.q_table,
+            state_key=state_key(env),
+            legal_actions=env.legal_actions(),
+            epsilon=self.epsilon,
+        )
+
+
 def other_player(player: int) -> int:
     if player == PLAYER_ONE:
         return PLAYER_TWO
@@ -264,11 +280,234 @@ def other_player(player: int) -> int:
     raise ValueError("player must be 1 or 2")
 
 
-def make_player(kind: PlayerKind):
+def state_key(env: ConnectFourEnv) -> tuple[int, ...]:
+    """Return a hashable symbolic state from the current player's perspective.
+
+    The key is based on the current_player observation, not the absolute 1/2 board.
+    This lets a single Q-table learn a policy for "me" versus "opponent".
+    """
+
+    original_mode = env.observation_mode
+    env.observation_mode = "current_player"
+    try:
+        obs = env.observation().astype(np.int8)
+    finally:
+        env.observation_mode = original_mode
+    return tuple(int(x) for x in obs.reshape(-1))
+
+
+def q_values_for(q_table: dict[tuple[int, ...], np.ndarray], key: tuple[int, ...]) -> np.ndarray:
+    if key not in q_table:
+        q_table[key] = np.zeros(COLS, dtype=np.float32)
+    return q_table[key]
+
+
+def best_legal_action(q_values: np.ndarray, legal_actions: list[int]) -> int:
+    if not legal_actions:
+        raise RuntimeError("no legal actions available")
+    legal_values = [(float(q_values[action]), action) for action in legal_actions]
+    max_value = max(value for value, _ in legal_values)
+    best_actions = [action for value, action in legal_values if value == max_value]
+    return random.choice(best_actions)
+
+
+def choose_epsilon_greedy_action(
+    q_table: dict[tuple[int, ...], np.ndarray],
+    state_key: tuple[int, ...],
+    legal_actions: list[int],
+    epsilon: float,
+) -> int:
+    if random.random() < epsilon:
+        return random.choice(legal_actions)
+    return best_legal_action(q_values_for(q_table, state_key), legal_actions)
+
+
+def update_q_value(
+    q_table: dict[tuple[int, ...], np.ndarray],
+    key: tuple[int, ...],
+    action: int,
+    reward: float,
+    next_key: tuple[int, ...] | None,
+    next_legal_actions: list[int],
+    alpha: float,
+    gamma: float,
+) -> None:
+    q_values = q_values_for(q_table, key)
+    old_value = float(q_values[action])
+
+    if next_key is None or not next_legal_actions:
+        target = reward
+    else:
+        next_q_values = q_values_for(q_table, next_key)
+        next_best = max(float(next_q_values[next_action]) for next_action in next_legal_actions)
+        target = reward + gamma * next_best
+
+    q_values[action] = old_value + alpha * (target - old_value)
+
+
+def train_q_learning_vs_random(
+    episodes: int,
+    alpha: float,
+    gamma: float,
+    epsilon: float,
+    epsilon_min: float,
+    epsilon_decay: float,
+    seed: int | None = None,
+) -> dict[tuple[int, ...], np.ndarray]:
+    """Train a tabular Q-learning policy against a random opponent.
+
+    The learned agent always acts from the current_player perspective. Training alternates
+    whether it plays first or second, so the table sees both roles through the same
+    relative state encoding.
+    """
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    q_table: dict[tuple[int, ...], np.ndarray] = {}
+    random_player = RandomPlayer()
+    wins = 0
+    losses = 0
+    draws = 0
+
+    for episode in range(1, episodes + 1):
+        env = ConnectFourEnv(observation_mode="current_player")
+        agent_player = PLAYER_ONE if episode % 2 else PLAYER_TWO
+        env.reset(starting_player=PLAYER_ONE)
+
+        if agent_player == PLAYER_TWO:
+            env.step(random_player.choose_action(env))
+
+        while not env.done:
+            key = state_key(env)
+            legal = env.legal_actions()
+            action = choose_epsilon_greedy_action(q_table, key, legal, epsilon)
+            agent_result = env.step(action)
+
+            if agent_result.done:
+                reward = terminal_reward(env.last_winner, agent_player)
+                update_q_value(q_table, key, action, reward, None, [], alpha, gamma)
+                break
+
+            opponent_action = random_player.choose_action(env)
+            opponent_result = env.step(opponent_action)
+
+            if opponent_result.done:
+                reward = terminal_reward(env.last_winner, agent_player)
+                update_q_value(q_table, key, action, reward, None, [], alpha, gamma)
+                break
+
+            next_key = state_key(env)
+            update_q_value(
+                q_table=q_table,
+                key=key,
+                action=action,
+                reward=0.0,
+                next_key=next_key,
+                next_legal_actions=env.legal_actions(),
+                alpha=alpha,
+                gamma=gamma,
+            )
+
+        if env.last_winner == agent_player:
+            wins += 1
+        elif env.last_winner is None:
+            draws += 1
+        else:
+            losses += 1
+
+        epsilon = max(epsilon_min, epsilon * epsilon_decay)
+
+        if episode == 1 or episode % max(1, episodes // 10) == 0:
+            LOGGER.info(
+                "episode=%s/%s q_states=%s epsilon=%.4f recent/all wins=%s losses=%s draws=%s",
+                episode,
+                episodes,
+                len(q_table),
+                epsilon,
+                wins,
+                losses,
+                draws,
+            )
+
+    return q_table
+
+
+def terminal_reward(winner: int | None, agent_player: int) -> float:
+    if winner == agent_player:
+        return 1.0
+    if winner is None:
+        return 0.0
+    return -1.0
+
+
+def evaluate_q_vs_random(
+    q_table: dict[tuple[int, ...], np.ndarray],
+    games: int,
+    seed: int | None = None,
+) -> dict[str, int]:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    wins = 0
+    losses = 0
+    draws = 0
+    random_player = RandomPlayer()
+    q_player = QLearningPlayer(q_table, epsilon=0.0)
+
+    for game in range(1, games + 1):
+        env = ConnectFourEnv(observation_mode="current_player")
+        agent_player = PLAYER_ONE if game % 2 else PLAYER_TWO
+        env.reset(starting_player=PLAYER_ONE)
+
+        while not env.done:
+            if env.current_player == agent_player:
+                action = q_player.choose_action(env)
+            else:
+                action = random_player.choose_action(env)
+            env.step(action)
+
+        if env.last_winner == agent_player:
+            wins += 1
+        elif env.last_winner is None:
+            draws += 1
+        else:
+            losses += 1
+
+    return {"wins": wins, "losses": losses, "draws": draws}
+
+
+def save_q_table(q_table: dict[tuple[int, ...], np.ndarray], path: str | Path) -> None:
+    payload = {
+        "rows": ROWS,
+        "cols": COLS,
+        "q_table": q_table,
+    }
+    with Path(path).open("wb") as f:
+        pickle.dump(payload, f)
+
+
+def load_q_table(path: str | Path) -> dict[tuple[int, ...], np.ndarray]:
+    with Path(path).open("rb") as f:
+        payload = pickle.load(f)
+
+    if payload.get("rows") != ROWS or payload.get("cols") != COLS:
+        raise ValueError("Q-table board dimensions do not match this environment")
+
+    return payload["q_table"]
+
+
+def make_player(kind: PlayerKind, q_table: dict[tuple[int, ...], np.ndarray] | None = None):
     if kind == "human":
         return HumanPlayer()
     if kind == "random":
         return RandomPlayer()
+    if kind == "q":
+        if q_table is None:
+            raise ValueError("q player requires a loaded Q-table")
+        return QLearningPlayer(q_table)
     raise ValueError(f"unknown player kind: {kind}")
 
 
@@ -278,6 +517,7 @@ def play_game(
     observation_mode: ObservationMode = "current_player",
     seed: int | None = None,
     verbose: bool = True,
+    q_table: dict[tuple[int, ...], np.ndarray] | None = None,
 ) -> int | None:
     if seed is not None:
         random.seed(seed)
@@ -285,8 +525,8 @@ def play_game(
 
     env = ConnectFourEnv(observation_mode=observation_mode)
     players = {
-        PLAYER_ONE: make_player(player_one),
-        PLAYER_TWO: make_player(player_two),
+        PLAYER_ONE: make_player(player_one, q_table=q_table),
+        PLAYER_TWO: make_player(player_two, q_table=q_table),
     }
 
     env.reset()
@@ -337,13 +577,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Connect Four environment")
     parser.add_argument(
         "--p1",
-        choices=["human", "random"],
+        choices=["human", "random", "q"],
         default="human",
         help="Player 1 controller",
     )
     parser.add_argument(
         "--p2",
-        choices=["human", "random"],
+        choices=["human", "random", "q"],
         default="random",
         help="Player 2 controller",
     )
@@ -366,11 +606,40 @@ def parse_args() -> argparse.Namespace:
         help="Run N random-vs-random games without printing boards",
     )
     parser.add_argument(
+        "--train-q",
+        type=int,
+        default=0,
+        metavar="EPISODES",
+        help="Train a tabular Q-learning agent against a random opponent",
+    )
+    parser.add_argument(
+        "--eval-q",
+        type=int,
+        default=0,
+        metavar="GAMES",
+        help="Evaluate a loaded or newly trained Q-table against a random opponent",
+    )
+    parser.add_argument(
+        "--q-table",
+        default="connect_four_q_table.pkl",
+        help="Path used to save/load a Q-table",
+    )
+    parser.add_argument("--alpha", type=float, default=0.2, help="Q-learning update rate")
+    parser.add_argument("--gamma", type=float, default=0.95, help="Q-learning discount factor")
+    parser.add_argument("--epsilon", type=float, default=0.2, help="Initial epsilon for exploration")
+    parser.add_argument("--epsilon-min", type=float, default=0.02, help="Minimum epsilon during training")
+    parser.add_argument("--epsilon-decay", type=float, default=0.9995, help="Per-episode epsilon decay")
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="Print game boards and results",
-        )
+        help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--quiet-board",
+        action="store_true",
+        help="Do not print boards when playing a single game",
+    )
     return parser.parse_args()
 
 
@@ -380,16 +649,47 @@ def main() -> None:
     if args.verbose:
         LOGGER.setLevel(logging.DEBUG)
 
+    q_table: dict[tuple[int, ...], np.ndarray] | None = None
+
     if args.random_smoke_test > 0:
         run_random_smoke_tests(args.random_smoke_test, seed=args.seed)
         return
+
+    if args.train_q > 0:
+        q_table = train_q_learning_vs_random(
+            episodes=args.train_q,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            epsilon=args.epsilon,
+            epsilon_min=args.epsilon_min,
+            epsilon_decay=args.epsilon_decay,
+            seed=args.seed,
+        )
+        save_q_table(q_table, args.q_table)
+        print(f"Saved Q-table with {len(q_table)} states to {args.q_table}")
+
+    if args.eval_q > 0:
+        if q_table is None:
+            q_table = load_q_table(args.q_table)
+        results = evaluate_q_vs_random(q_table, games=args.eval_q, seed=args.seed)
+        print(f"Q vs random over {args.eval_q} games")
+        print(f"Wins:   {results['wins']}")
+        print(f"Losses: {results['losses']}")
+        print(f"Draws:  {results['draws']}")
+        if args.train_q > 0:
+            return
+
+    if args.p1 == "q" or args.p2 == "q":
+        if q_table is None:
+            q_table = load_q_table(args.q_table)
 
     play_game(
         player_one=args.p1,
         player_two=args.p2,
         observation_mode=args.observation_mode,
         seed=args.seed,
-        verbose=True,
+        verbose=not args.quiet_board,
+        q_table=q_table,
     )
 
 
