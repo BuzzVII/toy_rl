@@ -25,7 +25,7 @@ EMPTY = 0
 PLAYER_ONE = 1
 PLAYER_TWO = 2
 
-PlayerKind = Literal["human", "random", "q"]
+PlayerKind = Literal["human", "random", "uniform_random", "q"]
 ObservationMode = Literal["absolute", "current_player"]
 
 
@@ -41,6 +41,15 @@ class StepResult:
     reward: float
     done: bool
     info: dict
+
+
+@dataclass(frozen=True)
+class TacticalPosition:
+    name: str
+    board_text: str
+    current_player: int
+    expected_actions: tuple[int, ...]
+    description: str
 
 
 class ConnectFourEnv:
@@ -231,11 +240,42 @@ class ConnectFourEnv:
         return "\n".join(lines)
 
 
-class RandomPlayer:
+class UniformRandomPlayer:
+    """Pure random player with no tactics. Useful as a weak baseline."""
+
     def choose_action(self, env: ConnectFourEnv) -> int:
         legal = env.legal_actions()
         if not legal:
             raise RuntimeError("no legal actions available")
+        return random.choice(legal)
+
+
+class RandomPlayer:
+    """Heuristic-random player.
+
+    This is still stochastic, but it avoids obviously bad tactical moves:
+        1. Win immediately if possible.
+        2. Block the opponent's immediate win if possible.
+        3. Otherwise choose a legal move uniformly at random.
+
+    Keeping this as the default random player gives the learner more useful
+    tactical examples than pure random play.
+    """
+
+    def choose_action(self, env: ConnectFourEnv) -> int:
+        legal = env.legal_actions()
+        if not legal:
+            raise RuntimeError("no legal actions available")
+
+        winning_action = find_immediate_winning_action(env.board, legal, env.current_player)
+        if winning_action is not None:
+            return winning_action
+
+        opponent = other_player(env.current_player)
+        blocking_action = find_immediate_winning_action(env.board, legal, opponent)
+        if blocking_action is not None:
+            return blocking_action
+
         return random.choice(legal)
 
 
@@ -271,6 +311,74 @@ class QLearningPlayer:
             epsilon=self.epsilon,
         )
 
+
+
+def find_immediate_winning_action(
+    board: np.ndarray,
+    legal_actions: list[int],
+    player: int,
+) -> int | None:
+    """Return a legal column that wins immediately for player, if one exists."""
+
+    winning_actions: list[int] = []
+    for col in legal_actions:
+        row = landing_row(board, col)
+        if row is None:
+            continue
+        candidate = board.copy()
+        candidate[row, col] = player
+        if has_four_from_board(candidate, row, col):
+            winning_actions.append(col)
+
+    if not winning_actions:
+        return None
+    return random.choice(winning_actions)
+
+
+def landing_row(board: np.ndarray, col: int) -> int | None:
+    for row in range(ROWS - 1, -1, -1):
+        if board[row, col] == EMPTY:
+            return row
+    return None
+
+
+def has_four_from_board(board: np.ndarray, row: int, col: int) -> bool:
+    player = int(board[row, col])
+    if player == EMPTY:
+        return False
+
+    directions = [
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (1, -1),
+    ]
+
+    for dr, dc in directions:
+        total = 1
+        total += count_direction_on_board(board, row, col, dr, dc, player)
+        total += count_direction_on_board(board, row, col, -dr, -dc, player)
+        if total >= 4:
+            return True
+    return False
+
+
+def count_direction_on_board(
+    board: np.ndarray,
+    row: int,
+    col: int,
+    dr: int,
+    dc: int,
+    player: int,
+) -> int:
+    count = 0
+    r = row + dr
+    c = col + dc
+    while 0 <= r < ROWS and 0 <= c < COLS and int(board[r, c]) == player:
+        count += 1
+        r += dr
+        c += dc
+    return count
 
 def other_player(player: int) -> int:
     if player == PLAYER_ONE:
@@ -352,14 +460,26 @@ def train_q_learning_vs_random(
     epsilon: float,
     epsilon_min: float,
     epsilon_decay: float,
+    tactical_training_ratio: float = 0.0,
     seed: int | None = None,
 ) -> dict[tuple[int, ...], np.ndarray]:
-    """Train a tabular Q-learning policy against a random opponent.
+    """Train a tabular Q-learning policy against the default random opponent.
 
-    The learned agent always acts from the current_player perspective. Training alternates
-    whether it plays first or second, so the table sees both roles through the same
-    relative state encoding.
+    The default RandomPlayer is heuristic-random: it wins immediately when it can,
+    blocks immediate opponent wins when it can, and otherwise plays randomly.
+
+    This is not self-play. The learned agent alternates playing first and second
+    during normal episodes, but its opponent is still the RandomPlayer policy.
+
+    If tactical_training_ratio is greater than zero, some episodes start from one
+    of the hand-built tactical positions instead of an empty board. In those
+    episodes, the Q-learner controls the side whose turn it is in the tactical
+    position. This exposes the learner to rare immediate-win and must-block
+    states, including diagonals.
     """
+
+    if not 0.0 <= tactical_training_ratio <= 1.0:
+        raise ValueError("tactical_training_ratio must be between 0.0 and 1.0")
 
     if seed is not None:
         random.seed(seed)
@@ -370,14 +490,25 @@ def train_q_learning_vs_random(
     wins = 0
     losses = 0
     draws = 0
+    tactical_episodes = 0
+    positions = tactical_positions()
 
     for episode in range(1, episodes + 1):
-        env = ConnectFourEnv(observation_mode="current_player")
-        agent_player = PLAYER_ONE if episode % 2 else PLAYER_TWO
-        env.reset(starting_player=PLAYER_ONE)
+        use_tactical_start = random.random() < tactical_training_ratio
 
-        if agent_player == PLAYER_TWO:
-            env.step(random_player.choose_action(env))
+        if use_tactical_start:
+            tactical_episodes += 1
+            position = random.choice(positions)
+            env = make_env_from_position(position)
+            agent_player = env.current_player
+            LOGGER.debug("episode=%s tactical_start=%s", episode, position.name)
+        else:
+            env = ConnectFourEnv(observation_mode="current_player")
+            agent_player = PLAYER_ONE if episode % 2 else PLAYER_TWO
+            env.reset(starting_player=PLAYER_ONE)
+
+            if agent_player == PLAYER_TWO:
+                env.step(random_player.choose_action(env))
 
         while not env.done:
             key = state_key(env)
@@ -421,7 +552,7 @@ def train_q_learning_vs_random(
 
         if episode == 1 or episode % max(1, episodes // 10) == 0:
             LOGGER.info(
-                "episode=%s/%s q_states=%s epsilon=%.4f recent/all wins=%s losses=%s draws=%s",
+                "episode=%s/%s q_states=%s epsilon=%.4f wins=%s losses=%s draws=%s tactical_starts=%s",
                 episode,
                 episodes,
                 len(q_table),
@@ -429,6 +560,7 @@ def train_q_learning_vs_random(
                 wins,
                 losses,
                 draws,
+                tactical_episodes,
             )
 
     return q_table
@@ -504,6 +636,8 @@ def make_player(kind: PlayerKind, q_table: dict[tuple[int, ...], np.ndarray] | N
         return HumanPlayer()
     if kind == "random":
         return RandomPlayer()
+    if kind == "uniform_random":
+        return UniformRandomPlayer()
     if kind == "q":
         if q_table is None:
             raise ValueError("q player requires a loaded Q-table")
@@ -555,6 +689,201 @@ def play_game(
     return winner
 
 
+
+def board_from_text(board_text: str) -> np.ndarray:
+    """Parse a 6-line board string into the internal board array.
+
+    Accepted symbols:
+        . = empty
+        X = player one
+        O = player two
+
+    Whitespace inside rows is ignored, so both "X O ." and "XO." work.
+    """
+
+    symbol_to_value = {
+        ".": EMPTY,
+        "X": PLAYER_ONE,
+        "O": PLAYER_TWO,
+    }
+    rows: list[list[int]] = []
+
+    for raw_line in board_text.strip().splitlines():
+        line = raw_line.strip().replace(" ", "")
+        if not line:
+            continue
+        if len(line) != COLS:
+            raise ValueError(f"expected {COLS} columns, got {len(line)} in row {line!r}")
+        try:
+            rows.append([symbol_to_value[char] for char in line])
+        except KeyError as exc:
+            raise ValueError(f"unsupported board symbol: {exc.args[0]!r}") from exc
+
+    if len(rows) != ROWS:
+        raise ValueError(f"expected {ROWS} rows, got {len(rows)}")
+
+    return np.array(rows, dtype=np.int8)
+
+
+def make_env_from_position(position: TacticalPosition) -> ConnectFourEnv:
+    env = ConnectFourEnv(observation_mode="current_player")
+    env.board = board_from_text(position.board_text)
+    env.current_player = position.current_player
+    env.last_winner = None
+    env.done = False
+    return env
+
+
+def tactical_positions() -> list[TacticalPosition]:
+    """Return small tactical positions used to evaluate local game sense.
+
+    These are not full-game benchmarks. They test whether a player handles
+    one-move tactics from already constructed legal-looking positions.
+    """
+
+    return [
+        TacticalPosition(
+            name="win_horizontal",
+            board_text="""
+.......
+.......
+.......
+.......
+OO.....
+XXX....
+""",
+            current_player=PLAYER_ONE,
+            expected_actions=(3,),
+            description="Current player can win immediately with a horizontal four.",
+        ),
+        TacticalPosition(
+            name="block_horizontal",
+            board_text="""
+.......
+.......
+.......
+.......
+XX.....
+OOO....
+""",
+            current_player=PLAYER_ONE,
+            expected_actions=(3,),
+            description="Opponent has three horizontally; current player must block.",
+        ),
+        TacticalPosition(
+            name="block_vertical",
+            board_text="""
+.......
+.......
+.......
+...O...
+...O...
+XX.O...
+""",
+            current_player=PLAYER_ONE,
+            expected_actions=(3,),
+            description="Opponent has three vertically; current player must block the column.",
+        ),
+        TacticalPosition(
+            name="block_diagonal_positive_slope",
+            board_text="""
+.......
+.......
+.......
+..OX...
+.O.X...
+O..X...
+""",
+            current_player=PLAYER_ONE,
+            expected_actions=(3,),
+            description="Opponent threatens a bottom-left to top-right diagonal.",
+        ),
+        TacticalPosition(
+            name="block_diagonal_negative_slope",
+            board_text="""
+.......
+.......
+O......
+XO.....
+XXO....
+XXX....
+""",
+            current_player=PLAYER_ONE,
+            expected_actions=(3,),
+            description="Opponent threatens a top-left to bottom-right diagonal.",
+        ),
+        TacticalPosition(
+            name="block_horizontal_gap",
+            board_text="""
+.......
+.......
+.......
+.......
+XX.....
+OO.O...
+""",
+            current_player=PLAYER_ONE,
+            expected_actions=(2,),
+            description="Opponent has a horizontal gap threat; current player must fill the gap.",
+        ),
+        TacticalPosition(
+            name="win_beats_block",
+            board_text="""
+.......
+.......
+.......
+.......
+.......
+XXX.OOO
+""",
+            current_player=PLAYER_ONE,
+            expected_actions=(3,),
+            description="Current player should win immediately rather than block opponent's threat.",
+        ),
+    ]
+
+
+def evaluate_tactical_positions(
+    player_kind: PlayerKind,
+    q_table: dict[tuple[int, ...], np.ndarray] | None = None,
+    seed: int | None = None,
+    verbose: bool = False,
+) -> dict[str, int]:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    player = make_player(player_kind, q_table=q_table)
+    passed = 0
+    failed = 0
+
+    print(f"Tactical evaluation for player={player_kind}")
+    print()
+
+    for position in tactical_positions():
+        env = make_env_from_position(position)
+        action = player.choose_action(env)
+        ok = action in position.expected_actions
+
+        if ok:
+            passed += 1
+            status = "PASS"
+        else:
+            failed += 1
+            status = "FAIL"
+
+        expected = ", ".join(str(a) for a in position.expected_actions)
+        print(f"{status} {position.name}: chose {action}, expected {expected}")
+        print(f"  {position.description}")
+        if verbose or not ok:
+            print(env.render_text())
+        print()
+
+    total = passed + failed
+    print(f"Tactical score: {passed}/{total} passed, {failed} failed")
+    return {"passed": passed, "failed": failed, "total": total}
+
+
 def run_random_smoke_tests(num_games: int, seed: int | None = None) -> None:
     if seed is not None:
         random.seed(seed)
@@ -577,15 +906,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Connect Four environment")
     parser.add_argument(
         "--p1",
-        choices=["human", "random", "q"],
+        choices=["human", "random", "uniform_random", "q"],
         default="human",
-        help="Player 1 controller",
+        help="Player 1 controller. random means heuristic-random; uniform_random is pure random.",
     )
     parser.add_argument(
         "--p2",
-        choices=["human", "random", "q"],
+        choices=["human", "random", "uniform_random", "q"],
         default="random",
-        help="Player 2 controller",
+        help="Player 2 controller. random means heuristic-random; uniform_random is pure random.",
     )
     parser.add_argument(
         "--observation-mode",
@@ -610,14 +939,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         metavar="EPISODES",
-        help="Train a tabular Q-learning agent against a random opponent",
+        help="Train a tabular Q-learning agent against the heuristic-random opponent",
     )
     parser.add_argument(
         "--eval-q",
         type=int,
         default=0,
         metavar="GAMES",
-        help="Evaluate a loaded or newly trained Q-table against a random opponent",
+        help="Evaluate a loaded or newly trained Q-table against the heuristic-random opponent",
+    )
+    parser.add_argument(
+        "--eval-tactics",
+        choices=["human", "random", "uniform_random", "q"],
+        default=None,
+        metavar="PLAYER",
+        help="Evaluate one player against fixed tactical positions",
     )
     parser.add_argument(
         "--q-table",
@@ -629,6 +965,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=0.2, help="Initial epsilon for exploration")
     parser.add_argument("--epsilon-min", type=float, default=0.02, help="Minimum epsilon during training")
     parser.add_argument("--epsilon-decay", type=float, default=0.9995, help="Per-episode epsilon decay")
+    parser.add_argument(
+        "--tactical-training-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of Q-learning episodes that start from fixed tactical positions",
+    )
     parser.add_argument(
         "-v",
         "--verbose",
@@ -663,6 +1005,7 @@ def main() -> None:
             epsilon=args.epsilon,
             epsilon_min=args.epsilon_min,
             epsilon_decay=args.epsilon_decay,
+            tactical_training_ratio=args.tactical_training_ratio,
             seed=args.seed,
         )
         save_q_table(q_table, args.q_table)
@@ -672,11 +1015,23 @@ def main() -> None:
         if q_table is None:
             q_table = load_q_table(args.q_table)
         results = evaluate_q_vs_random(q_table, games=args.eval_q, seed=args.seed)
-        print(f"Q vs random over {args.eval_q} games")
+        print(f"Q vs heuristic-random over {args.eval_q} games")
         print(f"Wins:   {results['wins']}")
         print(f"Losses: {results['losses']}")
         print(f"Draws:  {results['draws']}")
         if args.train_q > 0:
+            return
+
+    if args.eval_tactics is not None:
+        if args.eval_tactics == "q" and q_table is None:
+            q_table = load_q_table(args.q_table)
+        evaluate_tactical_positions(
+            player_kind=args.eval_tactics,
+            q_table=q_table,
+            seed=args.seed,
+            verbose=args.verbose,
+        )
+        if args.train_q > 0 or args.eval_q > 0 or args.eval_tactics is not None:
             return
 
     if args.p1 == "q" or args.p2 == "q":
