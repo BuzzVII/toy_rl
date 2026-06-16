@@ -12,8 +12,12 @@ import argparse
 import random
 from typing import Literal
 
+import logging
+
 import numpy as np
 
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 ROWS = 6
 COLS = 7
@@ -321,6 +325,7 @@ def run_random_smoke_tests(num_games: int, seed: int | None = None) -> None:
     for _ in range(num_games):
         winner = play_game("random", "random", verbose=False)
         wins[winner] += 1
+        LOGGER.debug(f"Game finished. Winner: {winner}. Current tally: {wins}")
 
     print(f"Random smoke test over {num_games} games")
     print(f"Player 1 wins: {wins[PLAYER_ONE]}")
@@ -360,11 +365,20 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Run N random-vs-random games without printing boards",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print game boards and results",
+        )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.verbose:
+        LOGGER.setLevel(logging.DEBUG)
 
     if args.random_smoke_test > 0:
         run_random_smoke_tests(args.random_smoke_test, seed=args.seed)
