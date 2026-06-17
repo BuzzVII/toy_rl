@@ -3,6 +3,7 @@
 # dependencies = [
 #   "numpy",
 #   "torch",
+#   "matplotlib",
 # ]
 # ///
 
@@ -55,6 +56,17 @@ class TacticalPosition:
     current_player: int
     expected_actions: tuple[int, ...]
     description: str
+
+
+@dataclass
+class TrainingHistory:
+    steps: list[int]
+    episodes: list[int]
+    total_losses: list[float]
+    actor_losses: list[float]
+    critic_losses: list[float]
+    entropies: list[float]
+    rewards: list[float]
 
 
 
@@ -537,6 +549,8 @@ def train_actor_critic_vs_random(
     tactical_training_ratio: float = 0.0,
     seed: int | None = None,
     device_name: str = "auto",
+    training_plot_path: str | Path | None = None,
+    training_metrics_csv: str | Path | None = None,
 ) -> ActorCriticNet:
     """Train actor-critic on symbolic observations against heuristic-random.
 
@@ -568,6 +582,15 @@ def train_actor_critic_vs_random(
     recent_actor_losses: list[float] = []
     recent_critic_losses: list[float] = []
     recent_entropies: list[float] = []
+    history = TrainingHistory(
+        steps=[],
+        episodes=[],
+        total_losses=[],
+        actor_losses=[],
+        critic_losses=[],
+        entropies=[],
+        rewards=[],
+    )
 
     for episode in range(1, episodes + 1):
         use_tactical_start = random.random() < tactical_training_ratio
@@ -623,6 +646,13 @@ def train_actor_critic_vs_random(
                 device=device,
             )
             learner_steps += 1
+            history.steps.append(learner_steps)
+            history.episodes.append(episode)
+            history.total_losses.append(total_loss)
+            history.actor_losses.append(actor_loss)
+            history.critic_losses.append(critic_loss)
+            history.entropies.append(ent)
+            history.rewards.append(float(reward))
             recent_total_losses.append(total_loss)
             recent_actor_losses.append(actor_loss)
             recent_critic_losses.append(critic_loss)
@@ -661,7 +691,176 @@ def train_actor_critic_vs_random(
             )
 
     model.eval()
+    if training_metrics_csv is not None:
+        write_training_metrics_csv(history, training_metrics_csv)
+    if training_plot_path is not None:
+        plot_training_history(history, training_plot_path)
     return model
+
+
+
+def moving_average(values: list[float], window: int) -> tuple[list[int], list[float]]:
+    if not values:
+        return [], []
+    window = max(1, min(window, len(values)))
+    averaged: list[float] = []
+    indices: list[int] = []
+    running_sum = 0.0
+    queue: list[float] = []
+    for index, value in enumerate(values, start=1):
+        queue.append(float(value))
+        running_sum += float(value)
+        if len(queue) > window:
+            running_sum -= queue.pop(0)
+        averaged.append(running_sum / len(queue))
+        indices.append(index)
+    return indices, averaged
+
+
+def plot_training_history(history: TrainingHistory, output_path: str | Path, smoothing_window: int = 200) -> None:
+    """Save a matplotlib training diagnostics plot.
+
+    The plot shows smoothed total, actor, and critic losses. Entropy is saved as
+    a separate plot beside it because it has a different scale from the losses.
+    """
+
+    if not history.steps:
+        LOGGER.warning("no training history available; not writing plot")
+        return
+
+    import matplotlib.pyplot as plt
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    xs, total = moving_average(history.total_losses, smoothing_window)
+    _, actor = moving_average(history.actor_losses, smoothing_window)
+    _, critic = moving_average(history.critic_losses, smoothing_window)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(xs, total, label="total loss")
+    plt.plot(xs, actor, label="actor loss")
+    plt.plot(xs, critic, label="critic loss")
+    plt.xlabel("Learner update step")
+    plt.ylabel("Smoothed loss")
+    plt.title("Actor-critic training losses")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+    entropy_path = output_path.with_name(f"{output_path.stem}_entropy{output_path.suffix}")
+    xs, entropy = moving_average(history.entropies, smoothing_window)
+    plt.figure(figsize=(10, 6))
+    plt.plot(xs, entropy, label="entropy")
+    plt.xlabel("Learner update step")
+    plt.ylabel("Smoothed entropy")
+    plt.title("Actor policy entropy")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(entropy_path, dpi=150)
+    plt.close()
+
+    LOGGER.info("saved training loss plot to %s", output_path)
+    LOGGER.info("saved entropy plot to %s", entropy_path)
+
+
+def write_training_metrics_csv(history: TrainingHistory, output_path: str | Path) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as file:
+        file.write("step,episode,total_loss,actor_loss,critic_loss,entropy,reward\n")
+        for row in zip(
+            history.steps,
+            history.episodes,
+            history.total_losses,
+            history.actor_losses,
+            history.critic_losses,
+            history.entropies,
+            history.rewards,
+        ):
+            file.write(",".join(str(value) for value in row) + "\n")
+    LOGGER.info("saved training metrics CSV to %s", output_path)
+
+
+def actor_critic_snapshot(
+    model: ActorCriticNet,
+    env: ConnectFourEnv,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    obs = observation_from_env(env)
+    legal_mask = env.legal_action_mask()
+    mask_tensor = torch.as_tensor(legal_mask, dtype=torch.bool, device=device)
+    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+    model.eval()
+    with torch.no_grad():
+        logits, value = model(obs_tensor)
+        masked_logits = logits[0].masked_fill(~mask_tensor, -1.0e9)
+        probs = torch.softmax(masked_logits, dim=0)
+    return logits[0].detach().cpu().numpy(), probs.detach().cpu().numpy(), float(value.item())
+
+
+def plot_actor_critic_move(
+    model: ActorCriticNet,
+    env: ConnectFourEnv,
+    move_index: int,
+    player_id: int,
+    action: int | None,
+    device_name: str,
+    output_dir: str | Path | None = None,
+    show: bool = False,
+) -> None:
+    """Plot actor probabilities and critic value for the current board."""
+
+    if output_dir is None and not show:
+        return
+
+    import matplotlib.pyplot as plt
+
+    device = resolve_device(device_name)
+    _, probs, value = actor_critic_snapshot(model, env, device)
+    columns = list(range(COLS))
+
+    suffix = f"move_{move_index:03d}_player_{player_id}"
+    if output_dir is not None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        actor_path = output_path / f"{suffix}_actor.png"
+        critic_path = output_path / f"{suffix}_critic.png"
+    else:
+        actor_path = None
+        critic_path = None
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(columns, probs)
+    if action is not None:
+        plt.axvline(action, linestyle="--", label=f"chosen column {action}")
+        plt.legend()
+    plt.xticks(columns)
+    plt.ylim(0.0, 1.0)
+    plt.xlabel("Column")
+    plt.ylabel("Actor probability")
+    plt.title(f"Actor move probabilities, move {move_index}, player {player_id}")
+    plt.tight_layout()
+    if actor_path is not None:
+        plt.savefig(actor_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+    plt.figure(figsize=(5, 5))
+    plt.bar(["V(state)"], [value])
+    plt.axhline(0.0, linewidth=1)
+    plt.ylim(-1.1, 1.1)
+    plt.ylabel("Critic value")
+    plt.title(f"Critic board score, move {move_index}, player {player_id}")
+    plt.tight_layout()
+    if critic_path is not None:
+        plt.savefig(critic_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
 
 
 def evaluate_actor_critic_vs_random(
@@ -756,6 +955,8 @@ def play_game(
     verbose: bool = True,
     ac_model: ActorCriticNet | None = None,
     device_name: str = "auto",
+    show_ac_plots: bool = False,
+    save_ac_plots_dir: str | Path | None = None,
 ) -> int | None:
     if seed is not None:
         random.seed(seed)
@@ -774,10 +975,24 @@ def play_game(
         print(env.render_text())
         print()
 
+    move_index = 0
     while not env.done:
-        player = players[env.current_player]
+        player_id = env.current_player
+        player = players[player_id]
         action = player.choose_action(env)
+        if ac_model is not None and (show_ac_plots or save_ac_plots_dir is not None) and isinstance(player, ActorCriticPlayer):
+            plot_actor_critic_move(
+                model=ac_model,
+                env=env,
+                move_index=move_index,
+                player_id=player_id,
+                action=action,
+                device_name=device_name,
+                output_dir=save_ac_plots_dir,
+                show=show_ac_plots,
+            )
         result = env.step(action)
+        move_index += 1
 
         if verbose:
             print(f"Player {result.info['player_moved']} plays column {action}")
@@ -1063,6 +1278,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4, help="Optimiser learning rate")
     parser.add_argument("--value-loss-weight", type=float, default=0.5, help="Weight on critic/value loss")
     parser.add_argument("--entropy-weight", type=float, default=0.01, help="Weight on entropy exploration bonus")
+    parser.add_argument(
+        "--training-plot",
+        default=None,
+        help="Optional PNG path for a matplotlib plot of actor-critic training losses",
+    )
+    parser.add_argument(
+        "--training-metrics-csv",
+        default=None,
+        help="Optional CSV path for raw per-update training metrics",
+    )
+    parser.add_argument(
+        "--show-ac-plots",
+        action="store_true",
+        help="Show matplotlib actor/critic plots for each actor-critic move during single-game play",
+    )
+    parser.add_argument(
+        "--save-ac-plots-dir",
+        default=None,
+        help="Optional directory to save actor/critic PNG plots for each actor-critic move during single-game play",
+    )
     parser.add_argument("--device", default="auto", help="Torch device: auto, cpu, cuda, etc.")
     parser.add_argument(
         "--tactical-training-ratio",
@@ -1101,6 +1336,8 @@ def main() -> None:
             tactical_training_ratio=args.tactical_training_ratio,
             seed=args.seed,
             device_name=args.device,
+            training_plot_path=args.training_plot,
+            training_metrics_csv=args.training_metrics_csv,
         )
         save_actor_critic_model(ac_model, args.ac_model)
         print(f"Saved actor-critic model to {args.ac_model}")
@@ -1141,6 +1378,8 @@ def main() -> None:
         verbose=not args.quiet_board,
         ac_model=ac_model,
         device_name=args.device,
+        show_ac_plots=args.show_ac_plots,
+        save_ac_plots_dir=args.save_ac_plots_dir,
     )
 
 
