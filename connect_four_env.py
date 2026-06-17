@@ -9,7 +9,6 @@
 from dataclasses import dataclass
 from enum import Enum
 import argparse
-from collections import deque
 import logging
 import random
 from pathlib import Path
@@ -31,7 +30,7 @@ EMPTY = 0
 PLAYER_ONE = 1
 PLAYER_TWO = 2
 
-PlayerKind = Literal["human", "random", "uniform_random", "dqn"]
+PlayerKind = Literal["human", "random", "uniform_random", "ac"]
 ObservationMode = Literal["absolute", "current_player"]
 
 
@@ -58,14 +57,6 @@ class TacticalPosition:
     description: str
 
 
-@dataclass(frozen=True)
-class Transition:
-    observation: np.ndarray
-    action: int
-    reward: float
-    next_observation: np.ndarray
-    next_legal_mask: np.ndarray
-    done: bool
 
 
 class ConnectFourEnv:
@@ -312,31 +303,44 @@ class HumanPlayer:
             print(f"Illegal move. Legal columns are: {legal}")
 
 
-class DQN(nn.Module):
-    """Small MLP mapping a symbolic board observation to 7 column Q-values."""
+
+class ActorCriticNet(nn.Module):
+    """Small MLP with an actor head and a critic head.
+
+    Input:
+        2 x 6 x 7 symbolic current-player observation.
+
+    Outputs:
+        logits: 7 unnormalised action preferences, one per column.
+        value: scalar V(state), estimated return for the current player.
+    """
 
     def __init__(self, hidden_size: int = 128) -> None:
         super().__init__()
-        self.net = nn.Sequential(
+        self.shared = nn.Sequential(
             nn.Flatten(),
             nn.Linear(2 * ROWS * COLS, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, COLS),
         )
+        self.actor = nn.Linear(hidden_size, COLS)
+        self.critic = nn.Linear(hidden_size, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.shared(x)
+        logits = self.actor(features)
+        value = self.critic(features).squeeze(-1)
+        return logits, value
 
 
-class DQNPlayer:
-    """Greedy player backed by a neural Q-network."""
+class ActorCriticPlayer:
+    """Greedy player backed by the actor head of an actor-critic network."""
 
-    def __init__(self, model: DQN, device: torch.device | str = "cpu", epsilon: float = 0.0) -> None:
+    def __init__(self, model: ActorCriticNet, device: torch.device | str = "cpu", sample: bool = False) -> None:
         self.model = model
         self.device = torch.device(device)
-        self.epsilon = epsilon
+        self.sample = sample
         self.model.to(self.device)
         self.model.eval()
 
@@ -344,15 +348,16 @@ class DQNPlayer:
         legal = env.legal_actions()
         if not legal:
             raise RuntimeError("no legal actions available")
-        if random.random() < self.epsilon:
-            return random.choice(legal)
 
         obs = observation_from_env(env)
+        legal_mask = torch.as_tensor(env.legal_action_mask(), dtype=torch.bool, device=self.device)
         with torch.no_grad():
-            q_values = self.model(torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0))[0]
-        return best_legal_action_from_tensor(q_values, legal)
-
-
+            logits, _ = self.model(torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0))
+            masked_logits = logits[0].masked_fill(~legal_mask, -1.0e9)
+            if self.sample:
+                dist = torch.distributions.Categorical(logits=masked_logits)
+                return int(dist.sample().item())
+            return best_legal_action_from_tensor(masked_logits, legal)
 def find_immediate_winning_action(
     board: np.ndarray,
     legal_actions: list[int],
@@ -457,106 +462,87 @@ def terminal_reward(winner: int | None, agent_player: int) -> float:
     return -1.0
 
 
-class ReplayBuffer:
-    def __init__(self, capacity: int) -> None:
-        self.buffer: deque[Transition] = deque(maxlen=capacity)
 
-    def append(self, transition: Transition) -> None:
-        self.buffer.append(transition)
-
-    def __len__(self) -> int:
-        return len(self.buffer)
-
-    def sample(self, batch_size: int) -> list[Transition]:
-        return random.sample(self.buffer, batch_size)
-
-
-def choose_dqn_epsilon_greedy_action(
-    model: DQN,
+def select_actor_action(
+    model: ActorCriticNet,
     observation: np.ndarray,
-    legal_actions: list[int],
-    epsilon: float,
+    legal_mask: np.ndarray,
     device: torch.device,
-) -> int:
-    if random.random() < epsilon:
-        return random.choice(legal_actions)
-    model.eval()
-    with torch.no_grad():
-        q_values = model(torch.as_tensor(observation, dtype=torch.float32, device=device).unsqueeze(0))[0]
-    return best_legal_action_from_tensor(q_values, legal_actions)
+) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample one legal action and return action, log_prob, entropy, value."""
+
+    obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+    mask_tensor = torch.as_tensor(legal_mask, dtype=torch.bool, device=device)
+    logits, value = model(obs_tensor)
+    masked_logits = logits[0].masked_fill(~mask_tensor, -1.0e9)
+    dist = torch.distributions.Categorical(logits=masked_logits)
+    action = dist.sample()
+    return int(action.item()), dist.log_prob(action), dist.entropy(), value.squeeze(0)
 
 
-def optimise_dqn_batch(
-    policy_net: DQN,
-    target_net: DQN,
+def optimise_actor_critic_step(
+    model: ActorCriticNet,
     optimiser: optim.Optimizer,
-    replay: ReplayBuffer,
-    batch_size: int,
+    log_prob: torch.Tensor,
+    entropy: torch.Tensor,
+    value: torch.Tensor,
+    reward: float,
+    next_observation: np.ndarray | None,
+    done: bool,
     gamma: float,
+    value_loss_weight: float,
+    entropy_weight: float,
     device: torch.device,
-) -> float | None:
-    if len(replay) < batch_size:
-        return None
+) -> tuple[float, float, float, float]:
+    """Run one one-step actor-critic update.
 
-    transitions = replay.sample(batch_size)
-    observations = torch.as_tensor(
-        np.stack([t.observation for t in transitions]),
-        dtype=torch.float32,
-        device=device,
-    )
-    actions = torch.as_tensor([t.action for t in transitions], dtype=torch.long, device=device).unsqueeze(1)
-    rewards = torch.as_tensor([t.reward for t in transitions], dtype=torch.float32, device=device)
-    next_observations = torch.as_tensor(
-        np.stack([t.next_observation for t in transitions]),
-        dtype=torch.float32,
-        device=device,
-    )
-    done = torch.as_tensor([t.done for t in transitions], dtype=torch.bool, device=device)
-    next_masks = torch.as_tensor(
-        np.stack([t.next_legal_mask for t in transitions]),
-        dtype=torch.bool,
-        device=device,
-    )
-
-    policy_net.train()
-    q_values = policy_net(observations).gather(1, actions).squeeze(1)
+    The target is reward + gamma * V(next_state), unless the game ended.
+    The actor is updated with -log_prob(action) * advantage.
+    The critic is updated with squared error against the bootstrapped target.
+    """
 
     with torch.no_grad():
-        next_q_values = target_net(next_observations)
-        next_q_values = next_q_values.masked_fill(~next_masks, -1.0e9)
-        next_best = next_q_values.max(dim=1).values
-        next_best = torch.where(done, torch.zeros_like(next_best), next_best)
-        targets = rewards + gamma * next_best
+        if done or next_observation is None:
+            target = torch.tensor(float(reward), dtype=torch.float32, device=device)
+        else:
+            next_tensor = torch.as_tensor(next_observation, dtype=torch.float32, device=device).unsqueeze(0)
+            _, next_value = model(next_tensor)
+            target = torch.tensor(float(reward), dtype=torch.float32, device=device) + gamma * next_value.squeeze(0)
 
-    loss = nn.functional.smooth_l1_loss(q_values, targets)
+    advantage = target - value
+    actor_loss = -log_prob * advantage.detach()
+    critic_loss = advantage.pow(2)
+    entropy_loss = -entropy
+    loss = actor_loss + value_loss_weight * critic_loss + entropy_weight * entropy_loss
+
     optimiser.zero_grad(set_to_none=True)
     loss.backward()
-    nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=10.0)
+    nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
     optimiser.step()
-    return float(loss.detach().cpu())
+
+    return (
+        float(loss.detach().cpu()),
+        float(actor_loss.detach().cpu()),
+        float(critic_loss.detach().cpu()),
+        float(entropy.detach().cpu()),
+    )
 
 
-def train_dqn_vs_random(
+def train_actor_critic_vs_random(
     episodes: int,
     gamma: float,
-    epsilon: float,
-    epsilon_min: float,
-    epsilon_decay: float,
     learning_rate: float,
-    batch_size: int,
-    replay_capacity: int,
-    target_sync_interval: int,
-    train_frequency: int,
+    value_loss_weight: float,
+    entropy_weight: float,
     tactical_training_ratio: float = 0.0,
     seed: int | None = None,
     device_name: str = "auto",
-) -> DQN:
-    """Train a neural Q-network on symbolic observations against heuristic-random.
+) -> ActorCriticNet:
+    """Train actor-critic on symbolic observations against heuristic-random.
 
-    The opponent is treated as part of the environment. Each replay transition
-    goes from the learner's turn, through the learner's move and the opponent's
-    reply, back to the learner's next turn. This matches the tabular training
-    loop and keeps the Bellman target in the learner's perspective.
+    The opponent is treated as part of the environment. Each actor-critic update
+    follows one learner move plus the opponent response, so the next state is
+    again from the learner's perspective.
     """
 
     if not 0.0 <= tactical_training_ratio <= 1.0:
@@ -568,13 +554,8 @@ def train_dqn_vs_random(
         torch.manual_seed(seed)
 
     device = resolve_device(device_name)
-    policy_net = DQN().to(device)
-    target_net = DQN().to(device)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-
-    optimiser = optim.Adam(policy_net.parameters(), lr=learning_rate)
-    replay = ReplayBuffer(replay_capacity)
+    model = ActorCriticNet().to(device)
+    optimiser = optim.Adam(model.parameters(), lr=learning_rate)
     random_player = RandomPlayer()
     positions = tactical_positions()
 
@@ -582,8 +563,11 @@ def train_dqn_vs_random(
     losses = 0
     draws = 0
     tactical_episodes = 0
-    steps = 0
-    recent_losses: deque[float] = deque(maxlen=200)
+    learner_steps = 0
+    recent_total_losses: list[float] = []
+    recent_actor_losses: list[float] = []
+    recent_critic_losses: list[float] = []
+    recent_entropies: list[float] = []
 
     for episode in range(1, episodes + 1):
         use_tactical_start = random.random() < tactical_training_ratio
@@ -593,7 +577,7 @@ def train_dqn_vs_random(
             position = random.choice(positions)
             env = make_env_from_position(position)
             agent_player = env.current_player
-            LOGGER.debug("episode=%s dqn tactical_start=%s", episode, position.name)
+            LOGGER.debug("episode=%s actor_critic tactical_start=%s", episode, position.name)
         else:
             env = ConnectFourEnv(observation_mode="current_player")
             agent_player = PLAYER_ONE if episode % 2 else PLAYER_TWO
@@ -603,66 +587,51 @@ def train_dqn_vs_random(
 
         while not env.done:
             observation = observation_from_env(env)
-            legal = env.legal_actions()
-            action = choose_dqn_epsilon_greedy_action(policy_net, observation, legal, epsilon, device)
+            legal_mask = env.legal_action_mask()
+            model.train()
+            action, log_prob, entropy, value = select_actor_action(model, observation, legal_mask, device)
             agent_result = env.step(action)
 
             if agent_result.done:
                 reward = terminal_reward(env.last_winner, agent_player)
-                replay.append(
-                    Transition(
-                        observation=observation,
-                        action=action,
-                        reward=reward,
-                        next_observation=np.zeros_like(observation),
-                        next_legal_mask=np.zeros(COLS, dtype=bool),
-                        done=True,
-                    )
-                )
+                next_observation = None
+                done = True
             else:
                 opponent_action = random_player.choose_action(env)
                 opponent_result = env.step(opponent_action)
-
                 if opponent_result.done:
                     reward = terminal_reward(env.last_winner, agent_player)
-                    replay.append(
-                        Transition(
-                            observation=observation,
-                            action=action,
-                            reward=reward,
-                            next_observation=np.zeros_like(observation),
-                            next_legal_mask=np.zeros(COLS, dtype=bool),
-                            done=True,
-                        )
-                    )
+                    next_observation = None
+                    done = True
                 else:
-                    replay.append(
-                        Transition(
-                            observation=observation,
-                            action=action,
-                            reward=0.0,
-                            next_observation=observation_from_env(env),
-                            next_legal_mask=env.legal_action_mask(),
-                            done=False,
-                        )
-                    )
+                    reward = 0.0
+                    next_observation = observation_from_env(env)
+                    done = False
 
-            steps += 1
-            if steps % train_frequency == 0:
-                loss = optimise_dqn_batch(
-                    policy_net=policy_net,
-                    target_net=target_net,
-                    optimiser=optimiser,
-                    replay=replay,
-                    batch_size=batch_size,
-                    gamma=gamma,
-                    device=device,
-                )
-                if loss is not None:
-                    recent_losses.append(loss)
-
-            if steps % target_sync_interval == 0:
-                target_net.load_state_dict(policy_net.state_dict())
+            total_loss, actor_loss, critic_loss, ent = optimise_actor_critic_step(
+                model=model,
+                optimiser=optimiser,
+                log_prob=log_prob,
+                entropy=entropy,
+                value=value,
+                reward=reward,
+                next_observation=next_observation,
+                done=done,
+                gamma=gamma,
+                value_loss_weight=value_loss_weight,
+                entropy_weight=entropy_weight,
+                device=device,
+            )
+            learner_steps += 1
+            recent_total_losses.append(total_loss)
+            recent_actor_losses.append(actor_loss)
+            recent_critic_losses.append(critic_loss)
+            recent_entropies.append(ent)
+            if len(recent_total_losses) > 500:
+                recent_total_losses.pop(0)
+                recent_actor_losses.pop(0)
+                recent_critic_losses.pop(0)
+                recent_entropies.pop(0)
 
         if env.last_winner == agent_player:
             wins += 1
@@ -671,29 +640,32 @@ def train_dqn_vs_random(
         else:
             losses += 1
 
-        epsilon = max(epsilon_min, epsilon * epsilon_decay)
-
         if episode == 1 or episode % max(1, episodes // 10) == 0:
-            mean_loss = sum(recent_losses) / len(recent_losses) if recent_losses else float("nan")
+            mean_total = sum(recent_total_losses) / len(recent_total_losses) if recent_total_losses else float("nan")
+            mean_actor = sum(recent_actor_losses) / len(recent_actor_losses) if recent_actor_losses else float("nan")
+            mean_critic = sum(recent_critic_losses) / len(recent_critic_losses) if recent_critic_losses else float("nan")
+            mean_entropy = sum(recent_entropies) / len(recent_entropies) if recent_entropies else float("nan")
             LOGGER.info(
-                "episode=%s/%s replay=%s epsilon=%.4f wins=%s losses=%s draws=%s tactical_starts=%s mean_loss=%.5f",
+                "episode=%s/%s steps=%s wins=%s losses=%s draws=%s tactical_starts=%s loss=%.5f actor=%.5f critic=%.5f entropy=%.5f",
                 episode,
                 episodes,
-                len(replay),
-                epsilon,
+                learner_steps,
                 wins,
                 losses,
                 draws,
                 tactical_episodes,
-                mean_loss,
+                mean_total,
+                mean_actor,
+                mean_critic,
+                mean_entropy,
             )
 
-    policy_net.eval()
-    return policy_net
+    model.eval()
+    return model
 
 
-def evaluate_dqn_vs_random(
-    model: DQN,
+def evaluate_actor_critic_vs_random(
+    model: ActorCriticNet,
     games: int,
     seed: int | None = None,
     device_name: str = "auto",
@@ -704,7 +676,7 @@ def evaluate_dqn_vs_random(
         torch.manual_seed(seed)
 
     device = resolve_device(device_name)
-    dqn_player = DQNPlayer(model, device=device, epsilon=0.0)
+    ac_player = ActorCriticPlayer(model, device=device, sample=False)
     random_player = RandomPlayer()
     wins = 0
     losses = 0
@@ -717,7 +689,7 @@ def evaluate_dqn_vs_random(
 
         while not env.done:
             if env.current_player == agent_player:
-                action = dqn_player.choose_action(env)
+                action = ac_player.choose_action(env)
             else:
                 action = random_player.choose_action(env)
             env.step(action)
@@ -738,7 +710,7 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
-def save_dqn_model(model: DQN, path: str | Path) -> None:
+def save_actor_critic_model(model: ActorCriticNet, path: str | Path) -> None:
     payload = {
         "rows": ROWS,
         "cols": COLS,
@@ -748,20 +720,19 @@ def save_dqn_model(model: DQN, path: str | Path) -> None:
     torch.save(payload, Path(path))
 
 
-def load_dqn_model(path: str | Path, device_name: str = "auto") -> DQN:
+def load_actor_critic_model(path: str | Path, device_name: str = "auto") -> ActorCriticNet:
     device = resolve_device(device_name)
     payload = torch.load(Path(path), map_location=device)
     if payload.get("rows") != ROWS or payload.get("cols") != COLS:
-        raise ValueError("DQN model board dimensions do not match this environment")
-    model = DQN().to(device)
+        raise ValueError("Actor-critic model board dimensions do not match this environment")
+    model = ActorCriticNet().to(device)
     model.load_state_dict(payload["model_state_dict"])
     model.eval()
     return model
 
-
 def make_player(
     kind: PlayerKind,
-    dqn_model: DQN | None = None,
+    ac_model: ActorCriticNet | None = None,
     device_name: str = "auto",
 ):
     if kind == "human":
@@ -770,10 +741,10 @@ def make_player(
         return RandomPlayer()
     if kind == "uniform_random":
         return UniformRandomPlayer()
-    if kind == "dqn":
-        if dqn_model is None:
-            raise ValueError("dqn player requires a loaded DQN model")
-        return DQNPlayer(dqn_model, device=resolve_device(device_name))
+    if kind == "ac":
+        if ac_model is None:
+            raise ValueError("ac player requires a loaded actor-critic model")
+        return ActorCriticPlayer(ac_model, device=resolve_device(device_name))
     raise ValueError(f"unknown player kind: {kind}")
 
 
@@ -783,17 +754,18 @@ def play_game(
     observation_mode: ObservationMode = "current_player",
     seed: int | None = None,
     verbose: bool = True,
-    dqn_model: DQN | None = None,
+    ac_model: ActorCriticNet | None = None,
     device_name: str = "auto",
 ) -> int | None:
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
+        torch.manual_seed(seed)
 
     env = ConnectFourEnv(observation_mode=observation_mode)
     players = {
-        PLAYER_ONE: make_player(player_one, dqn_model=dqn_model, device_name=device_name),
-        PLAYER_TWO: make_player(player_two, dqn_model=dqn_model, device_name=device_name),
+        PLAYER_ONE: make_player(player_one, ac_model=ac_model, device_name=device_name),
+        PLAYER_TWO: make_player(player_two, ac_model=ac_model, device_name=device_name),
     }
 
     env.reset()
@@ -820,9 +792,6 @@ def play_game(
             print(f"Player {winner} wins")
 
     return winner
-
-
-
 def board_from_text(board_text: str) -> np.ndarray:
     """Parse a 6-line board string into the internal board array.
 
@@ -978,7 +947,7 @@ XXX.OOO
 
 def evaluate_tactical_positions(
     player_kind: PlayerKind,
-    dqn_model: DQN | None = None,
+    ac_model: ActorCriticNet | None = None,
     seed: int | None = None,
     verbose: bool = False,
     device_name: str = "auto",
@@ -987,7 +956,7 @@ def evaluate_tactical_positions(
         random.seed(seed)
         np.random.seed(seed)
 
-    player = make_player(player_kind, dqn_model=dqn_model, device_name=device_name)
+    player = make_player(player_kind, ac_model=ac_model, device_name=device_name)
     passed = 0
     failed = 0
 
@@ -1036,17 +1005,18 @@ def run_random_smoke_tests(num_games: int, seed: int | None = None) -> None:
     print(f"Draws:         {wins[None]}")
 
 
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Minimal Connect Four environment")
+    parser = argparse.ArgumentParser(description="Minimal Connect Four actor-critic environment")
     parser.add_argument(
         "--p1",
-        choices=["human", "random", "uniform_random", "dqn"],
+        choices=["human", "random", "uniform_random", "ac"],
         default="human",
         help="Player 1 controller. random means heuristic-random; uniform_random is pure random.",
     )
     parser.add_argument(
         "--p2",
-        choices=["human", "random", "uniform_random", "dqn"],
+        choices=["human", "random", "uniform_random", "ac"],
         default="random",
         help="Player 2 controller. random means heuristic-random; uniform_random is pure random.",
     )
@@ -1056,12 +1026,7 @@ def parse_args() -> argparse.Namespace:
         default="current_player",
         help="Observation encoding used by the environment",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed",
-    )
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument(
         "--random-smoke-test",
         type=int,
@@ -1069,40 +1034,35 @@ def parse_args() -> argparse.Namespace:
         help="Run N random-vs-random games without printing boards",
     )
     parser.add_argument(
-        "--train-dqn",
+        "--train-ac",
         type=int,
         default=0,
         metavar="EPISODES",
-        help="Train a neural DQN agent against the heuristic-random opponent using symbolic observations",
+        help="Train an actor-critic agent against the heuristic-random opponent using symbolic observations",
     )
     parser.add_argument(
-        "--eval-dqn",
+        "--eval-ac",
         type=int,
         default=0,
         metavar="GAMES",
-        help="Evaluate a loaded or newly trained DQN model against the heuristic-random opponent",
+        help="Evaluate a loaded or newly trained actor-critic model against the heuristic-random opponent",
     )
     parser.add_argument(
         "--eval-tactics",
-        choices=["human", "random", "uniform_random", "dqn"],
+        choices=["human", "random", "uniform_random", "ac"],
         default=None,
         metavar="PLAYER",
         help="Evaluate one player against fixed tactical positions",
     )
     parser.add_argument(
-        "--dqn-model",
-        default="connect_four_dqn.pt",
-        help="Path used to save/load a DQN model",
+        "--ac-model",
+        default="connect_four_actor_critic.pt",
+        help="Path used to save/load an actor-critic model",
     )
-    parser.add_argument("--gamma", type=float, default=0.95, help="DQN discount factor")
-    parser.add_argument("--epsilon", type=float, default=0.2, help="Initial epsilon for exploration")
-    parser.add_argument("--epsilon-min", type=float, default=0.02, help="Minimum epsilon during training")
-    parser.add_argument("--epsilon-decay", type=float, default=0.9995, help="Per-episode epsilon decay")
-    parser.add_argument("--learning-rate", type=float, default=1e-3, help="DQN optimiser learning rate")
-    parser.add_argument("--batch-size", type=int, default=64, help="DQN replay batch size")
-    parser.add_argument("--replay-capacity", type=int, default=50000, help="Maximum number of DQN replay transitions")
-    parser.add_argument("--target-sync-interval", type=int, default=250, help="DQN target-network sync interval in learner steps")
-    parser.add_argument("--train-frequency", type=int, default=4, help="Run one DQN optimiser step every N learner steps")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--learning-rate", type=float, default=3e-4, help="Optimiser learning rate")
+    parser.add_argument("--value-loss-weight", type=float, default=0.5, help="Weight on critic/value loss")
+    parser.add_argument("--entropy-weight", type=float, default=0.01, help="Weight on entropy exploration bonus")
     parser.add_argument("--device", default="auto", help="Torch device: auto, cpu, cuda, etc.")
     parser.add_argument(
         "--tactical-training-ratio",
@@ -1110,12 +1070,7 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Fraction of training episodes that start from fixed tactical positions",
     )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging",
-    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--quiet-board",
         action="store_true",
@@ -1130,58 +1085,53 @@ def main() -> None:
     if args.verbose:
         LOGGER.setLevel(logging.DEBUG)
 
-    dqn_model: DQN | None = None
+    ac_model: ActorCriticNet | None = None
 
     if args.random_smoke_test > 0:
         run_random_smoke_tests(args.random_smoke_test, seed=args.seed)
         return
 
-    if args.train_dqn > 0:
-        dqn_model = train_dqn_vs_random(
-            episodes=args.train_dqn,
+    if args.train_ac > 0:
+        ac_model = train_actor_critic_vs_random(
+            episodes=args.train_ac,
             gamma=args.gamma,
-            epsilon=args.epsilon,
-            epsilon_min=args.epsilon_min,
-            epsilon_decay=args.epsilon_decay,
             learning_rate=args.learning_rate,
-            batch_size=args.batch_size,
-            replay_capacity=args.replay_capacity,
-            target_sync_interval=args.target_sync_interval,
-            train_frequency=args.train_frequency,
+            value_loss_weight=args.value_loss_weight,
+            entropy_weight=args.entropy_weight,
             tactical_training_ratio=args.tactical_training_ratio,
             seed=args.seed,
             device_name=args.device,
         )
-        save_dqn_model(dqn_model, args.dqn_model)
-        print(f"Saved DQN model to {args.dqn_model}")
+        save_actor_critic_model(ac_model, args.ac_model)
+        print(f"Saved actor-critic model to {args.ac_model}")
 
-    if args.eval_dqn > 0:
-        if dqn_model is None:
-            dqn_model = load_dqn_model(args.dqn_model, device_name=args.device)
-        results = evaluate_dqn_vs_random(dqn_model, games=args.eval_dqn, seed=args.seed, device_name=args.device)
-        print(f"DQN vs heuristic-random over {args.eval_dqn} games")
+    if args.eval_ac > 0:
+        if ac_model is None:
+            ac_model = load_actor_critic_model(args.ac_model, device_name=args.device)
+        results = evaluate_actor_critic_vs_random(ac_model, games=args.eval_ac, seed=args.seed, device_name=args.device)
+        print(f"Actor-critic vs heuristic-random over {args.eval_ac} games")
         print(f"Wins:   {results['wins']}")
         print(f"Losses: {results['losses']}")
         print(f"Draws:  {results['draws']}")
 
     if args.eval_tactics is not None:
-        if args.eval_tactics == "dqn" and dqn_model is None:
-            dqn_model = load_dqn_model(args.dqn_model, device_name=args.device)
+        if args.eval_tactics == "ac" and ac_model is None:
+            ac_model = load_actor_critic_model(args.ac_model, device_name=args.device)
         evaluate_tactical_positions(
             player_kind=args.eval_tactics,
-            dqn_model=dqn_model,
+            ac_model=ac_model,
             seed=args.seed,
             verbose=args.verbose,
             device_name=args.device,
         )
         return
 
-    if args.train_dqn > 0 or args.eval_dqn > 0:
+    if args.train_ac > 0 or args.eval_ac > 0:
         return
 
-    if args.p1 == "dqn" or args.p2 == "dqn":
-        if dqn_model is None:
-            dqn_model = load_dqn_model(args.dqn_model, device_name=args.device)
+    if args.p1 == "ac" or args.p2 == "ac":
+        if ac_model is None:
+            ac_model = load_actor_critic_model(args.ac_model, device_name=args.device)
 
     play_game(
         player_one=args.p1,
@@ -1189,7 +1139,7 @@ def main() -> None:
         observation_mode=args.observation_mode,
         seed=args.seed,
         verbose=not args.quiet_board,
-        dqn_model=dqn_model,
+        ac_model=ac_model,
         device_name=args.device,
     )
 
